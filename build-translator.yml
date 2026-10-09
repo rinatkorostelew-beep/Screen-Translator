@@ -1,0 +1,801 @@
+name: Build Screen Translator APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: [".github/workflows/build-translator.yml"]
+
+permissions:
+  contents: write
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.7"
+
+      - name: Принять лицензии Android SDK
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+
+      - name: Создать проект
+        run: |
+          cat > settings.gradle <<'FILE_0_END'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "ScreenTranslator"
+          include ':app'
+          FILE_0_END
+          cat > build.gradle <<'FILE_1_END'
+          plugins {
+              id 'com.android.application' version '8.5.2' apply false
+          }
+          FILE_1_END
+          cat > gradle.properties <<'FILE_2_END'
+          android.useAndroidX=true
+          org.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8
+          FILE_2_END
+          mkdir -p app
+          cat > app/build.gradle <<'FILE_3_END'
+          plugins {
+              id 'com.android.application'
+          }
+
+          android {
+              namespace 'com.mushka.screentranslator'
+              compileSdk 34
+
+              defaultConfig {
+                  applicationId "com.mushka.screentranslator"
+                  minSdk 26
+                  targetSdk 34
+                  versionCode 1
+                  versionName "1.0"
+              }
+
+              buildTypes {
+                  release {
+                      minifyEnabled false
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+          }
+
+          tasks.withType(JavaCompile).configureEach {
+              options.encoding = 'UTF-8'
+          }
+
+          dependencies {
+              implementation 'com.google.mlkit:text-recognition:16.0.1'
+              implementation 'com.google.mlkit:text-recognition-chinese:16.0.1'
+              implementation 'com.google.mlkit:text-recognition-japanese:16.0.1'
+              implementation 'com.google.mlkit:text-recognition-korean:16.0.1'
+              implementation 'com.google.mlkit:language-id:17.0.6'
+              implementation 'com.google.mlkit:translate:17.0.3'
+          }
+          FILE_3_END
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'FILE_4_END'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.INTERNET" />
+
+              <application
+                  android:allowBackup="false"
+                  android:icon="@drawable/ic_launcher"
+                  android:label="Переводчик экрана"
+                  android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".TranslateService"
+                      android:exported="false"
+                      android:foregroundServiceType="mediaProjection" />
+              </application>
+          </manifest>
+          FILE_4_END
+          mkdir -p app/src/main/res/drawable
+          cat > app/src/main/res/drawable/ic_launcher.xml <<'FILE_5_END'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="108dp"
+              android:height="108dp"
+              android:viewportWidth="108"
+              android:viewportHeight="108">
+              <path
+                  android:fillColor="#4C6FFF"
+                  android:pathData="M0,0h108v108h-108z" />
+              <path
+                  android:fillColor="#FFFFFF"
+                  android:pathData="M30,34h48v10h-19v32h-10v-32h-19z" />
+          </vector>
+          FILE_5_END
+          mkdir -p app/src/main/java/com/mushka/screentranslator
+          cat > app/src/main/java/com/mushka/screentranslator/MainActivity.java <<'FILE_6_END'
+          package com.mushka.screentranslator;
+
+          import android.Manifest;
+          import android.app.Activity;
+          import android.content.Intent;
+          import android.content.SharedPreferences;
+          import android.content.pm.PackageManager;
+          import android.graphics.Color;
+          import android.media.projection.MediaProjectionManager;
+          import android.net.Uri;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.provider.Settings;
+          import android.widget.ArrayAdapter;
+          import android.widget.Button;
+          import android.widget.LinearLayout;
+          import android.widget.Spinner;
+          import android.widget.TextView;
+          import android.widget.Toast;
+
+          public class MainActivity extends Activity {
+              static final String[] SRC_NAMES = {"Английский и другие (латиница)", "Китайский", "Японский", "Корейский"};
+              static final String[] DST_NAMES = {"Русский", "English", "Українська", "Español", "Deutsch", "Français"};
+              static final String[] DST_CODES = {"ru", "en", "uk", "es", "de", "fr"};
+
+              private Spinner src;
+              private Spinner dst;
+              private SharedPreferences prefs;
+              private boolean askedNotifications = false;
+
+              @Override
+              protected void onCreate(Bundle b) {
+                  super.onCreate(b);
+                  prefs = getSharedPreferences("p", MODE_PRIVATE);
+                  int pad = (int) (20 * getResources().getDisplayMetrics().density);
+
+                  LinearLayout root = new LinearLayout(this);
+                  root.setOrientation(LinearLayout.VERTICAL);
+                  root.setPadding(pad, pad * 2, pad, pad);
+                  root.setBackgroundColor(Color.parseColor("#0E1020"));
+
+                  root.addView(label("Переводчик экрана", 26));
+                  root.addView(label("Выдели любую область на экране, и приложение переведёт текст в ней.", 15));
+                  root.addView(label("Язык текста на экране", 14));
+                  src = new Spinner(this);
+                  src.setAdapter(new ArrayAdapter<String>(this, android.R.layout.simple_spinner_dropdown_item, SRC_NAMES));
+                  src.setSelection(prefs.getInt("src", 0));
+                  root.addView(src);
+
+                  root.addView(label("Переводить на", 14));
+                  dst = new Spinner(this);
+                  dst.setAdapter(new ArrayAdapter<String>(this, android.R.layout.simple_spinner_dropdown_item, DST_NAMES));
+                  dst.setSelection(prefs.getInt("dst", 0));
+                  root.addView(dst);
+
+                  Button go = new Button(this);
+                  go.setText("Запустить");
+                  go.setOnClickListener(v -> start());
+                  root.addView(go);
+
+                  root.addView(label("После запуска появится плавающая кнопка «Аа». Нажми её, выдели область пальцем, и перевод появится рядом. Нажми на перевод, чтобы закрыть. Остановить можно в уведомлении.", 14));
+                  setContentView(root);
+              }
+
+              private TextView label(String text, int size) {
+                  TextView t = new TextView(this);
+                  t.setText(text);
+                  t.setTextSize(size);
+                  t.setTextColor(Color.WHITE);
+                  t.setPadding(0, size > 20 ? 0 : 12, 0, 12);
+                  return t;
+              }
+
+              private void start() {
+                  prefs.edit().putInt("src", src.getSelectedItemPosition()).putInt("dst", dst.getSelectedItemPosition()).apply();
+                  if (!Settings.canDrawOverlays(this)) {
+                      Toast.makeText(this, "Разреши показ поверх других окон, вернись и нажми «Запустить» снова", Toast.LENGTH_LONG).show();
+                      startActivity(new Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:" + getPackageName())));
+                      return;
+                  }
+                  if (Build.VERSION.SDK_INT >= 33 && !askedNotifications
+                          && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                      askedNotifications = true;
+                      requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, 7);
+                      return;
+                  }
+                  MediaProjectionManager m = (MediaProjectionManager) getSystemService(MEDIA_PROJECTION_SERVICE);
+                  startActivityForResult(m.createScreenCaptureIntent(), 1);
+              }
+
+              @Override
+              public void onRequestPermissionsResult(int code, String[] perms, int[] results) {
+                  super.onRequestPermissionsResult(code, perms, results);
+                  start();
+              }
+
+              @Override
+              protected void onActivityResult(int req, int res, Intent data) {
+                  super.onActivityResult(req, res, data);
+                  if (req == 1 && res == RESULT_OK && data != null) {
+                      Intent i = new Intent(this, TranslateService.class);
+                      i.putExtra("code", res);
+                      i.putExtra("data", data);
+                      startForegroundService(i);
+                      moveTaskToBack(true);
+                  }
+              }
+          }
+          FILE_6_END
+          mkdir -p app/src/main/java/com/mushka/screentranslator
+          cat > app/src/main/java/com/mushka/screentranslator/TranslateService.java <<'FILE_7_END'
+          package com.mushka.screentranslator;
+
+          import android.app.Notification;
+          import android.app.NotificationChannel;
+          import android.app.NotificationManager;
+          import android.app.PendingIntent;
+          import android.app.Service;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.content.SharedPreferences;
+          import android.content.pm.ServiceInfo;
+          import android.graphics.Bitmap;
+          import android.graphics.Canvas;
+          import android.graphics.Color;
+          import android.graphics.Paint;
+          import android.graphics.PixelFormat;
+          import android.graphics.Rect;
+          import android.graphics.drawable.GradientDrawable;
+          import android.hardware.display.DisplayManager;
+          import android.hardware.display.VirtualDisplay;
+          import android.media.Image;
+          import android.media.ImageReader;
+          import android.media.projection.MediaProjection;
+          import android.media.projection.MediaProjectionManager;
+          import android.os.Build;
+          import android.os.Handler;
+          import android.os.IBinder;
+          import android.os.Looper;
+          import android.text.TextUtils;
+          import android.util.DisplayMetrics;
+          import android.view.Display;
+          import android.view.Gravity;
+          import android.view.MotionEvent;
+          import android.view.View;
+          import android.view.WindowManager;
+          import android.widget.TextView;
+
+          import com.google.mlkit.common.model.DownloadConditions;
+          import com.google.mlkit.nl.languageid.LanguageIdentification;
+          import com.google.mlkit.nl.translate.TranslateLanguage;
+          import com.google.mlkit.nl.translate.Translation;
+          import com.google.mlkit.nl.translate.Translator;
+          import com.google.mlkit.nl.translate.TranslatorOptions;
+          import com.google.mlkit.vision.common.InputImage;
+          import com.google.mlkit.vision.text.Text;
+          import com.google.mlkit.vision.text.TextRecognition;
+          import com.google.mlkit.vision.text.TextRecognizer;
+          import com.google.mlkit.vision.text.chinese.ChineseTextRecognizerOptions;
+          import com.google.mlkit.vision.text.japanese.JapaneseTextRecognizerOptions;
+          import com.google.mlkit.vision.text.korean.KoreanTextRecognizerOptions;
+          import com.google.mlkit.vision.text.latin.TextRecognizerOptions;
+
+          public class TranslateService extends Service {
+              private final Handler h = new Handler(Looper.getMainLooper());
+              private WindowManager wm;
+              private MediaProjection mp;
+              private MediaProjection.Callback mpCallback;
+              private VirtualDisplay vd;
+              private ImageReader reader;
+              private int cw;
+              private int ch;
+              private int dpi;
+              private TextView fab;
+              private TextView card;
+              private SelView sel;
+              private TextRecognizer rec;
+              private int srcIdx;
+              private String dstCode = "ru";
+
+              @Override
+              public IBinder onBind(Intent in) {
+                  return null;
+              }
+
+              @Override
+              public int onStartCommand(Intent in, int flags, int startId) {
+                  if (in == null || "STOP".equals(in.getAction())) {
+                      stopSelf();
+                      return START_NOT_STICKY;
+                  }
+                  if (mp != null) {
+                      return START_NOT_STICKY;
+                  }
+                  SharedPreferences p = getSharedPreferences("p", MODE_PRIVATE);
+                  srcIdx = p.getInt("src", 0);
+                  dstCode = MainActivity.DST_CODES[Math.min(p.getInt("dst", 0), MainActivity.DST_CODES.length - 1)];
+                  startFg();
+
+                  MediaProjectionManager m = (MediaProjectionManager) getSystemService(MEDIA_PROJECTION_SERVICE);
+                  mp = m.getMediaProjection(in.getIntExtra("code", 0), (Intent) in.getParcelableExtra("data"));
+                  if (mp == null) {
+                      stopSelf();
+                      return START_NOT_STICKY;
+                  }
+                  mpCallback = new MediaProjection.Callback() {
+                      @Override
+                      public void onStop() {
+                          stopSelf();
+                      }
+                  };
+                  mp.registerCallback(mpCallback, h);
+                  wm = (WindowManager) getSystemService(WINDOW_SERVICE);
+                  makeDisplay();
+                  makeRecognizer();
+                  showFab();
+                  return START_NOT_STICKY;
+              }
+
+              private void startFg() {
+                  NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+                  nm.createNotificationChannel(new NotificationChannel("t", "Переводчик", NotificationManager.IMPORTANCE_LOW));
+                  Intent stop = new Intent(this, TranslateService.class).setAction("STOP");
+                  PendingIntent pi = PendingIntent.getService(this, 1, stop, PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
+                  Notification n = new Notification.Builder(this, "t")
+                          .setSmallIcon(android.R.drawable.ic_menu_search)
+                          .setContentTitle("Переводчик экрана работает")
+                          .setContentText("Нажми «Остановить», чтобы выключить")
+                          .addAction(new Notification.Action.Builder(android.R.drawable.ic_menu_close_clear_cancel, "Остановить", pi).build())
+                          .setOngoing(true)
+                          .build();
+                  if (Build.VERSION.SDK_INT >= 29) {
+                      startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION);
+                  } else {
+                      startForeground(1, n);
+                  }
+              }
+
+              private DisplayMetrics realMetrics() {
+                  DisplayMetrics dm = new DisplayMetrics();
+                  DisplayManager dmg = (DisplayManager) getSystemService(Context.DISPLAY_SERVICE);
+                  dmg.getDisplay(Display.DEFAULT_DISPLAY).getRealMetrics(dm);
+                  return dm;
+              }
+
+              private void makeDisplay() {
+                  DisplayMetrics dm = realMetrics();
+                  cw = dm.widthPixels;
+                  ch = dm.heightPixels;
+                  dpi = dm.densityDpi;
+                  reader = ImageReader.newInstance(cw, ch, PixelFormat.RGBA_8888, 2);
+                  vd = mp.createVirtualDisplay("cap", cw, ch, dpi, DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                          reader.getSurface(), null, h);
+              }
+
+              // экран мог повернуться: подгоняем размер захвата
+              private void fitDisplay() {
+                  DisplayMetrics dm = realMetrics();
+                  if (dm.widthPixels == cw && dm.heightPixels == ch) {
+                      return;
+                  }
+                  cw = dm.widthPixels;
+                  ch = dm.heightPixels;
+                  ImageReader old = reader;
+                  reader = ImageReader.newInstance(cw, ch, PixelFormat.RGBA_8888, 2);
+                  vd.resize(cw, ch, dpi);
+                  vd.setSurface(reader.getSurface());
+                  old.close();
+              }
+
+              private void makeRecognizer() {
+                  switch (srcIdx) {
+                      case 1:
+                          rec = TextRecognition.getClient(new ChineseTextRecognizerOptions.Builder().build());
+                          break;
+                      case 2:
+                          rec = TextRecognition.getClient(new JapaneseTextRecognizerOptions.Builder().build());
+                          break;
+                      case 3:
+                          rec = TextRecognition.getClient(new KoreanTextRecognizerOptions.Builder().build());
+                          break;
+                      default:
+                          rec = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS);
+                  }
+              }
+
+              private int dp(int v) {
+                  return (int) (v * getResources().getDisplayMetrics().density + 0.5f);
+              }
+
+              private WindowManager.LayoutParams params(int w, int hh) {
+                  WindowManager.LayoutParams lp = new WindowManager.LayoutParams(w, hh,
+                          WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                          WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                                  | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
+                                  | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
+                                  | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                          PixelFormat.TRANSLUCENT);
+                  lp.gravity = Gravity.TOP | Gravity.START;
+                  if (Build.VERSION.SDK_INT >= 30) {
+                      lp.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS;
+                  } else if (Build.VERSION.SDK_INT >= 28) {
+                      lp.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
+                  }
+                  return lp;
+              }
+
+              private void showFab() {
+                  int s = dp(52);
+                  fab = new TextView(this);
+                  fab.setText("Аа");
+                  fab.setTextColor(Color.WHITE);
+                  fab.setTextSize(18);
+                  fab.setGravity(Gravity.CENTER);
+                  GradientDrawable g = new GradientDrawable();
+                  g.setShape(GradientDrawable.OVAL);
+                  g.setColor(0xCC4C6FFF);
+                  fab.setBackground(g);
+                  final WindowManager.LayoutParams lp = params(s, s);
+                  lp.x = dp(12);
+                  lp.y = dp(120);
+                  fab.setOnTouchListener(new View.OnTouchListener() {
+                      float dx;
+                      float dy;
+                      boolean moved;
+
+                      @Override
+                      public boolean onTouch(View v, MotionEvent e) {
+                          switch (e.getAction()) {
+                              case MotionEvent.ACTION_DOWN:
+                                  dx = e.getRawX() - lp.x;
+                                  dy = e.getRawY() - lp.y;
+                                  moved = false;
+                                  return true;
+                              case MotionEvent.ACTION_MOVE:
+                                  if (Math.abs(e.getRawX() - dx - lp.x) > dp(4) || Math.abs(e.getRawY() - dy - lp.y) > dp(4)) {
+                                      moved = true;
+                                  }
+                                  if (moved) {
+                                      lp.x = (int) (e.getRawX() - dx);
+                                      lp.y = (int) (e.getRawY() - dy);
+                                      wm.updateViewLayout(fab, lp);
+                                  }
+                                  return true;
+                              case MotionEvent.ACTION_UP:
+                                  if (!moved) {
+                                      startSelect();
+                                  }
+                                  return true;
+                              default:
+                                  return false;
+                          }
+                      }
+                  });
+                  wm.addView(fab, lp);
+              }
+
+              private class SelView extends View {
+                  final Paint dim = new Paint();
+                  final Paint line = new Paint();
+                  final Paint txt = new Paint();
+                  float x0;
+                  float y0;
+                  float x1;
+                  float y1;
+                  boolean has;
+
+                  SelView(Context c) {
+                      super(c);
+                      dim.setColor(0x88000000);
+                      line.setColor(0xFF6C8CFF);
+                      line.setStyle(Paint.Style.STROKE);
+                      line.setStrokeWidth(dp(2));
+                      txt.setColor(Color.WHITE);
+                      txt.setTextSize(dp(16));
+                      txt.setAntiAlias(true);
+                  }
+
+                  @Override
+                  protected void onDraw(Canvas c) {
+                      int[] o = new int[2];
+                      getLocationOnScreen(o);
+                      int w = getWidth();
+                      int hh = getHeight();
+                      if (!has) {
+                          c.drawRect(0, 0, w, hh, dim);
+                          c.drawText("Выдели область с текстом", dp(24), dp(80), txt);
+                          return;
+                      }
+                      float l = Math.min(x0, x1) - o[0];
+                      float r = Math.max(x0, x1) - o[0];
+                      float t = Math.min(y0, y1) - o[1];
+                      float b = Math.max(y0, y1) - o[1];
+                      c.drawRect(0, 0, w, t, dim);
+                      c.drawRect(0, b, w, hh, dim);
+                      c.drawRect(0, t, l, b, dim);
+                      c.drawRect(r, t, w, b, dim);
+                      c.drawRect(l, t, r, b, line);
+                  }
+
+                  @Override
+                  public boolean onTouchEvent(MotionEvent e) {
+                      switch (e.getAction()) {
+                          case MotionEvent.ACTION_DOWN:
+                              x0 = e.getRawX();
+                              x1 = x0;
+                              y0 = e.getRawY();
+                              y1 = y0;
+                              has = true;
+                              invalidate();
+                              return true;
+                          case MotionEvent.ACTION_MOVE:
+                              x1 = e.getRawX();
+                              y1 = e.getRawY();
+                              invalidate();
+                              return true;
+                          case MotionEvent.ACTION_UP:
+                              x1 = e.getRawX();
+                              y1 = e.getRawY();
+                              endSelect(new Rect((int) Math.min(x0, x1), (int) Math.min(y0, y1),
+                                      (int) Math.max(x0, x1), (int) Math.max(y0, y1)));
+                              return true;
+                          default:
+                              return true;
+                      }
+                  }
+              }
+
+              private void startSelect() {
+                  if (sel != null) {
+                      return;
+                  }
+                  dismissCard();
+                  sel = new SelView(this);
+                  wm.addView(sel, params(WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.MATCH_PARENT));
+                  fab.setVisibility(View.INVISIBLE);
+              }
+
+              private void endSelect(final Rect rc) {
+                  if (sel != null) {
+                      wm.removeView(sel);
+                      sel = null;
+                  }
+                  if (rc.width() < dp(24) || rc.height() < dp(16)) {
+                      fab.setVisibility(View.VISIBLE);
+                      return;
+                  }
+                  h.postDelayed(new Runnable() {
+                      @Override
+                      public void run() {
+                          capture(rc, 0);
+                      }
+                  }, 250);
+              }
+
+              private void capture(final Rect rc, final int n) {
+                  try {
+                      fitDisplay();
+                  } catch (Exception ignored) {
+                  }
+                  Image img = reader.acquireLatestImage();
+                  if (img == null) {
+                      if (n < 12) {
+                          h.postDelayed(new Runnable() {
+                              @Override
+                              public void run() {
+                                  capture(rc, n + 1);
+                              }
+                          }, 120);
+                      } else {
+                          fab.setVisibility(View.VISIBLE);
+                          showCard("Не удалось получить снимок экрана. Попробуй ещё раз.", rc);
+                      }
+                      return;
+                  }
+                  Bitmap shot;
+                  try {
+                      Image.Plane pl = img.getPlanes()[0];
+                      int ps = pl.getPixelStride();
+                      int rs = pl.getRowStride();
+                      Bitmap full = Bitmap.createBitmap(rs / ps, img.getHeight(), Bitmap.Config.ARGB_8888);
+                      full.copyPixelsFromBuffer(pl.getBuffer());
+                      int l = Math.max(0, rc.left);
+                      int t = Math.max(0, rc.top);
+                      int w = Math.max(1, Math.min(rc.width(), img.getWidth() - l));
+                      int hh = Math.max(1, Math.min(rc.height(), img.getHeight() - t));
+                      shot = Bitmap.createBitmap(full, l, t, w, hh);
+                      if (shot != full) {
+                          full.recycle();
+                      }
+                  } finally {
+                      img.close();
+                  }
+                  fab.setVisibility(View.VISIBLE);
+                  showCard("Распознаю текст…", rc);
+                  recognize(shot, rc);
+              }
+
+              private void recognize(Bitmap bmp, final Rect rc) {
+                  rec.process(InputImage.fromBitmap(bmp, 0))
+                          .addOnSuccessListener(t -> {
+                              StringBuilder sb = new StringBuilder();
+                              for (Text.TextBlock b : t.getTextBlocks()) {
+                                  if (sb.length() > 0) {
+                                      sb.append("\n");
+                                  }
+                                  sb.append(b.getText().replace("\n", " "));
+                              }
+                              String text = sb.toString().trim();
+                              if (text.isEmpty()) {
+                                  showCard("Текст не найден. Выдели область побольше или поближе к тексту.", rc);
+                              } else {
+                                  translate(text, rc);
+                              }
+                          })
+                          .addOnFailureListener(e -> showCard("Не удалось распознать текст: " + e.getMessage(), rc));
+              }
+
+              private void translate(final String text, final Rect rc) {
+                  if (srcIdx == 1) {
+                      go(text, TranslateLanguage.CHINESE, rc);
+                  } else if (srcIdx == 2) {
+                      go(text, TranslateLanguage.JAPANESE, rc);
+                  } else if (srcIdx == 3) {
+                      go(text, TranslateLanguage.KOREAN, rc);
+                  } else {
+                      LanguageIdentification.getClient().identifyLanguage(text)
+                              .addOnSuccessListener(tag -> {
+                                  String code = TranslateLanguage.fromLanguageTag(tag);
+                                  go(text, code == null ? TranslateLanguage.ENGLISH : code, rc);
+                              })
+                              .addOnFailureListener(e -> go(text, TranslateLanguage.ENGLISH, rc));
+                  }
+              }
+
+              private void go(final String text, final String from, final Rect rc) {
+                  if (from.equals(dstCode)) {
+                      showCard(text, rc);
+                      return;
+                  }
+                  TranslatorOptions o = new TranslatorOptions.Builder()
+                          .setSourceLanguage(from)
+                          .setTargetLanguage(dstCode)
+                          .build();
+                  final Translator tr = Translation.getClient(o);
+                  showCard("Перевожу… При первом запуске для языка скачивается модель, нужен интернет.", rc);
+                  tr.downloadModelIfNeeded(new DownloadConditions.Builder().build())
+                          .addOnSuccessListener(v -> tr.translate(text)
+                                  .addOnSuccessListener(res -> {
+                                      showCard(res, rc);
+                                      tr.close();
+                                  })
+                                  .addOnFailureListener(e -> {
+                                      showCard("Ошибка перевода: " + e.getMessage(), rc);
+                                      tr.close();
+                                  }))
+                          .addOnFailureListener(e -> {
+                              showCard("Не удалось скачать языковую модель. Проверь интернет.", rc);
+                              tr.close();
+                          });
+              }
+
+              private void showCard(String text, Rect rc) {
+                  dismissCard();
+                  card = new TextView(this);
+                  card.setText(text);
+                  card.setTextColor(Color.WHITE);
+                  card.setTextSize(16);
+                  card.setPadding(dp(14), dp(10), dp(14), dp(10));
+                  card.setMaxLines(16);
+                  card.setEllipsize(TextUtils.TruncateAt.END);
+                  GradientDrawable g = new GradientDrawable();
+                  g.setColor(0xF01B1E30);
+                  g.setCornerRadius(dp(14));
+                  g.setStroke(dp(1), 0x556C8CFF);
+                  card.setBackground(g);
+                  card.setOnClickListener(v -> dismissCard());
+
+                  int w = Math.min(Math.max(rc.width(), dp(260)), cw - dp(16));
+                  card.measure(View.MeasureSpec.makeMeasureSpec(w, View.MeasureSpec.EXACTLY),
+                          View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED));
+                  int mh = card.getMeasuredHeight();
+                  WindowManager.LayoutParams lp = params(w, WindowManager.LayoutParams.WRAP_CONTENT);
+                  lp.x = Math.max(dp(8), Math.min(rc.left, cw - w - dp(8)));
+                  int y = rc.bottom + dp(8);
+                  if (y + mh > ch - dp(8)) {
+                      y = Math.max(dp(8), rc.top - dp(8) - mh);
+                  }
+                  lp.y = y;
+                  wm.addView(card, lp);
+              }
+
+              private void dismissCard() {
+                  if (card != null) {
+                      try {
+                          wm.removeView(card);
+                      } catch (Exception ignored) {
+                      }
+                      card = null;
+                  }
+              }
+
+              @Override
+              public void onDestroy() {
+                  dismissCard();
+                  try {
+                      if (sel != null) {
+                          wm.removeView(sel);
+                      }
+                  } catch (Exception ignored) {
+                  }
+                  try {
+                      if (fab != null) {
+                          wm.removeView(fab);
+                      }
+                  } catch (Exception ignored) {
+                  }
+                  if (vd != null) {
+                      vd.release();
+                  }
+                  if (reader != null) {
+                      reader.close();
+                  }
+                  if (mp != null) {
+                      try {
+                          mp.unregisterCallback(mpCallback);
+                          mp.stop();
+                      } catch (Exception ignored) {
+                      }
+                  }
+                  if (rec != null) {
+                      rec.close();
+                  }
+                  super.onDestroy();
+              }
+          }
+          FILE_7_END
+
+      - name: Сборка APK
+        run: gradle assembleDebug --no-daemon
+
+      - name: Готовый файл
+        run: cp app/build/outputs/apk/debug/app-debug.apk screen-translator.apk
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: translator-${{ github.run_number }}
+          name: Переводчик экрана, сборка ${{ github.run_number }}
+          files: screen-translator.apk
